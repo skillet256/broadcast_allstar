@@ -1,0 +1,35 @@
+#!/bin/bash
+#KTD 12/11/20 this will broadcast arnewsline
+#Last Update: 3/16/23
+#This is the master script to broadcast arnewsline on allstar.
+#First, it will get the arnewsline audio url and save it in a file in the script directory
+#Then, it runs the broadcast_allstar script and generates a log
+#Optionally, this can be modified to broadcast ARRL news instead.
+#intended to be run as a cron job at broadcast time, as root on the ASL node you want,
+#using this command in root's crontab
+
+#----sample crontab entry start----
+#KTD 12/11/20 broadcast Amateur Radio Newsline audio every Friday evening                                                                            
+#0  18   *   *   5    . /root/.profile && /root/bin/arnewsline  
+#----sample crontab entry end----
+
+. /root/bin/environment_variables
+SCRIPTNAME=broadcast_allstar
+ARNEWSLINE_URL=arnewsline_url.txt
+ARRLNEWS_URL=arrlnews_urt.txt
+
+[ ! -f "$SCRIPT_DIR/$ARNEWSLINE_URL" ] && touch $SCRIPT_DIR/$ARNEWSLINE_URL
+[ ! -f "$SCRIPT_DIR/$ARRRLNEWS_URL" ] && touch $SCRIPT_DIR/$ARRLNEWS_URL
+python3 $SCRIPT_DIR/get-arnewsline.py $SCRIPT_DIR/$ARNEWSLINE_URL
+python3 $SCRIPT_DIR/get-arrlnews.py $SCRIPT_DIR/$ARRLNEWS_URL
+
+ARGUMENT_ARNEWSLINE=`cat $SCRIPT_DIR/$ARNEWSLINE_URL`
+ARGUMENT_ARRLNEWS=`cat $SCRIPT_DIR/$ARRLNEWS_URL`
+
+#echo $ARGUMENT_ARNEWSLINE
+#echo $ARGUMENT_ARRLNEWS
+
+#run the script
+# line below used if parameter should be passed
+$SCRIPT_DIR/$SCRIPTNAME $ARGUMENT_ARNEWSLINE &> $LOG_DIR/"$SERVERNAME"_"$SCRIPTNAME"."$LOG_EXTENSION"
+# $SCRIPT_DIR/$SCRIPTNAME $ARGUMENT_ARRLNEWS &> $LOG_DIR/"$SERVERNAME"_"$SCRIPTNAME"."$LOG_EXTENSION"

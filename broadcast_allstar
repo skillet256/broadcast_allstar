@@ -1,0 +1,291 @@
+#! /bin/bash
+#KTD broadcast_allstar: convert mp3 or wav files to ulaw for AllStar.
+#Designed by KA5D
+#first update: 12/11/20
+#last update: 3/16/23
+#This script runs via crontab for the owner (crontab -e) to edit
+#Can also be run interactively. See below.
+#
+#designed to accept a URI as input, or this file as input argument #1 (but could take any file, or multiples!)
+# ~/bin/arnewsline_audio.mp3
+#
+#Dependencies (linux packages required):
+# lame sox ffmpeg asterisk wget
+#
+#Interactive CLI Usage: broadcast_allstar input_audio_file1 [input_audio_file2...]
+#
+# Example Usage: broadcast_allstar [options: -a </path/to/asterisk> 
+#                                            -c <chunksize in secs> 
+#                                            -n <allstar node number> 
+#                                            -r <volume in DB reduction>] input_audio_file1 [input_audio_file2...]
+# Use either full path name or full URI for "input_audio_file<x>"
+
+#Usage guide:
+#1. use full path for all input files. Input files will not be altered or deleted.
+#2. output files will reside in the same path as input with the .ulaw extension, and will be deleted after use
+#3. This will also take one argument in the form of a URI that starts with 'http' and ends with 'mp3' or 'wav'
+#   And it will wget the file, then process it.
+#4. If you want to play audio files, then have them deleted afterward, put them in the /tmp directory. If not, put them somewhere else.
+
+############################################
+#variable declarations. Several of these can be passed as parameters. Values here are default values if not specified as arguments.
+#
+#make chunksize 550 seconds in production. This must be 30 seconds shorter that your repeater "totime" in /etc/asterisk/rpt.conf
+chunksize=550
+#change this to your local allstar node. This app will also read CLI parameter, or  $ASLNODE environment variable (set in /etc/environment) and use it if set.
+#aslnode=29010
+#this is the location of the aslnodeconf file
+aslnodeconf='/etc/asterisk/aslnode.conf'
+#this is the path to the allstar executable.
+aslcmd='/usr/sbin/asterisk'
+#this is the length in seconds of clips ONLY WHEN DEBUGGING. IF SET TO ZERO, THIS WILL PROCESS THE FULL FILE. IF NOT, IT WILL CLIP IT.
+shortlength=0
+#if hot audio or clipping occurs, set this to a value in DB between 0 and -20
+normalize_db=-10
+#this is how long to sleep in seconds between chunks of files being played. Let the repeater ID and rewind time out timer
+sleepbuffer=4
+#where to put temp files for processing
+tempdir='/tmp'
+#what to call temp files for getting URIs
+tempfile='temp.'
+#the final file type to convert to. Valid values are 'ulaw' or 'gsm'
+dest_ext='ulaw'
+#allstar playback mode. Valid boolean values are true or false for local or global playback
+global_playback=true
+#whether to be verbose with output. Default is to be quiet.
+quiet=true
+#list of dependencies. These programs must exist in the path in order to run
+dependencies=("lame" "sox" "soxi" "ffmpeg" "wget")
+###########################################
+
+[ -s "$aslnodeconf" ] && \. "$aslnodeconf"
+
+#this is the argument parser
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -a|--aslcmd)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        aslcmd=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -c|--chunksize)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        chunksize=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -l|--local)
+      global_playback=false
+      shift
+      ;;
+    -n|--node)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        aslnode=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -r|--reducevolume)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        normalize_db=$(( 0 - $2 ))
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -s|--shortlength)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        shortlength=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -t|--tempdir)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        tempdir=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    -v|--verbose)
+      quiet=false
+      shift
+      ;;
+    -*|--*=) # unsupported flags
+      echo "Error: Unsupported flag $1" >&2
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAMS="$PARAMS $1"
+      shift
+      ;;
+  esac
+done
+# set positional arguments in their proper place
+eval set -- "$PARAMS"
+
+PARAMS="${PARAMS:1}"
+
+if ! [ "$quiet" = true ]; then
+  echo "$PARAMS"
+fi
+#runtime logic to check for proper usage
+if [ $# -eq 0 ];  then
+  echo 'No arguments supplied. Usage: broadcast_allstar [options: -a </path/to/asterisk> -c <chunksize in secs> -n <allstar node number> -r <volume in DB reduction>] input_audio_file1 [input_audio_file2...]. Use either full path name or full URI.'
+  exit 1
+else
+  #inputfiles=( "$@" )
+  inputfiles=(${PARAMS})
+fi
+
+if ! [ "$quiet" = true ]; then
+  echo 'ASLNODE global environment variable='$ASLNODE', aslnode='$aslnode
+fi
+
+#get allstar node number global environment variable, if it exists
+if [ -z ${aslnode+x} ]; then
+  if [ -z ${ASLNODE+x} ]; then
+    echo 'Error. AllStar node not specified, and ASLNODE environment variable not set. Exiting.'
+    exit 1
+  else
+    aslnode="$ASLNODE"
+  fi
+fi
+
+#check to see if dependencies exist, exit 1 if they don't
+for dependency in "${dependencies[@]}"; do
+  if ! $(type "$dependency" > /dev/null 2>&1); then
+    echo 'Error: '$dependency' is not in the PATH. Exiting.'
+    exit 1
+  fi
+done
+
+#loop through arguments and process
+a=0
+for audio in "${inputfiles[@]}"; do
+  #check if argument is file or URI. wget if it is URI. Either way, copy into temp dir
+  if ! [ "$quiet" = true ]; then
+    echo $audio
+  fi
+  if [ ${audio:0:4} == "http" ]; then
+    audioinput=$tempdir/$tempfile${audio: -3}
+    wget -q $audio -O $audioinput
+  else
+    if [[ -f "$audio" && ( ${audio: -3} == "mp3" || ${audio: -3} == "wav") ]]; then
+      if ! [[ "$audio" == "$tempdir/$(basename $audio)" ]]; then
+        cp -f $audio $tempdir/$(basename $audio)
+      fi
+      audioinput=$tempdir/$(basename $audio)
+    else
+      echo 'Error: File '$audio' does not exist or is not the right file type, exiting.'
+      exit 1
+    fi
+  fi
+
+  #check if it's a valid file type, exit 1 if not
+  file_ext=${audioinput: -3}
+  #split file into chunks of a specified length in seconds
+  if ! [ "$quiet" = true ]; then
+    echo 'Splitting '$audioinput' into chunks of '$chunksize' seconds...'
+  fi
+  ffmpeg -hide_banner -loglevel error -y -i $audioinput -f segment -segment_time $chunksize -c copy ${audioinput%.*}_%04d.$file_ext
+  filechunks=${audioinput%.*}_*.$file_ext
+  if ! [ "$quiet" = true ]; then
+    echo $audioinput' split into these chunks: '$filechunks
+  fi
+
+  #loop through the chunks of the audio file and convert to format allstar can play
+  i=0
+  for filechunk in $filechunks
+  do
+    workfile=$filechunk
+    #KTD debug stanza start
+    if [ "$shortlength" -ne "0" ]; then
+      #take the first few seconds of the file, use for debugging
+      if ! [ "$quiet" = true ]; then
+        echo 'Taking the first '$shortlength' seconds of '$workfile' ...'
+      fi
+      ffmpeg -hide_banner -loglevel error -y -i $workfile -ss 0 -to $shortlength -c copy ${workfile%.*}_short.$file_ext
+      mv -f ${workfile%.*}_short.$file_ext $workfile
+    fi
+    #KTD debug stanza end
+
+    #if mp3, convert mp3 to wav
+    if [ $file_ext == "mp3" ]; then
+      if ! [ "$quiet" = true ]; then
+        echo 'Converting '$workfile' to wav format...'
+      fi
+      lame --nohist --quiet --decode $workfile ${workfile%.*}.wav
+      rm -f $workfile
+      workfile=${workfile%.*}.wav
+    fi
+
+    #calcuate time to sleep until file chunk is done playing
+    sleeptime=`soxi -D $workfile`
+    if ! [ "$quiet" = true ]; then
+      echo 'Duration of file in seconds: '$sleeptime
+    fi
+    if [ $dest_ext == "ulaw" ]; then
+      #convert wav to ulaw
+      #echo 'Converting '$workfile' to '$dest_ext' format...'
+      sox -q -V1 --norm=$normalize_db $workfile -r 8000 -c 1 -t ul ${workfile%.*}.$dest_ext
+    elif [ $dest_ext == "gsm" ]; then
+      #convert wav to gsm
+      #echo 'Converting '$workfile' to '$dest_ext' format...'
+      sox -q -V1 --norm=$normalize_db $workfile -r 8000 -c 1 ${workfile%.*}.$dest_ext resample -q1
+    else
+      echo 'Error: '$dest_ext' is not a valid allstar file. Exiting.'
+      rm -f $workfile
+      exit 1
+    fi
+    #echo 'Deleting '$workfile' ...'
+    rm -f $workfile
+    workfile=${workfile%.*}.$dest_ext
+    #play the file on the allstar node
+    playfile=${workfile%.*}
+
+    #put a buffer of size $sleepbuffer between file chunks if not the last one, otherwise add 1 second.
+    #echo 'i='$i', inner array index='${#filechunks[$@]}
+    #echo 'a='$a', outer loop array index='${#inputfile[@]}
+    #if [ ${#filechunks[@]} -ne ${!filechunks[@]} ]; then
+    sleeptime=$((${sleeptime%.*} + $sleepbuffer))
+    #else
+      #sleeptime=$((${sleeptime%.*} + 1))
+    #fi
+    #echo 'sleeptime='$sleeptime
+
+    #play the audio chunk on allstar
+    if ! [ "$quiet" = true ]; then
+      echo 'Playing '$playfile' on AllStar node '$aslnode' now...'
+    fi
+    if [ "$global_playback" = true ]; then
+      #global playback
+      $aslcmd -rx "rpt playback $aslnode $playfile" &
+    else
+      #local playback
+      $aslcmd -rx "rpt localplay $aslnode $playfile" &
+    fi
+    sleep $sleeptime
+    rm -f $workfile
+    i=$(($i + 1))
+  done
+  rm -f $audioinput
+  a=$(($a + 1))
+done
+
+exit 0
